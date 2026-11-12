@@ -7,7 +7,14 @@ object NowPlaying {
     @Volatile var updatedAtMs: Long = 0L
         private set
     @Volatile var listenerConnected: Boolean = false
+    /** Album-art status, e.g. "Cover: sent to remote" or why it wasn't sent. */
+    @Volatile var cover: String = ""
+        private set
     var onChange: (() -> Unit)? = null
+
+    fun setCover(s: String) {
+        if (s != cover) { cover = s; onChange?.invoke() }
+    }
 
     fun set(s: String) {
         if (s != text) { text = s; onChange?.invoke() }

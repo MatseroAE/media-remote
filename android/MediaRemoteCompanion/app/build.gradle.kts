@@ -11,8 +11,8 @@ android {
         applicationId = "com.diy.mediaremote"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
     }
 
     // One fixed key for every build (Android Studio and GitHub Actions), so a newer APK installs

@@ -201,6 +201,13 @@ class MediaListenerService : NotificationListenerService(), BleLink.Listener {
         lastArtKey = key
         lastArtHadBitmap = bmp != null
         val data = try { bmp?.let { Protocol.artToRgb565(it) } } catch (e: Exception) { null }
+        if (data == null) {
+            val webOnly = md != null && listOf(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, MediaMetadata.METADATA_KEY_ART_URI,
+                MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI).any { md.getString(it)?.startsWith("http") == true }
+            NowPlaying.setCover(
+                if (webOnly) "Cover: ${c?.packageName} only shares a web link to its artwork (not supported yet)"
+                else "Cover: ${c?.packageName ?: "this app"} isn't sharing artwork for this song")
+        }
         BleLink.updateArt(data)
     }
 

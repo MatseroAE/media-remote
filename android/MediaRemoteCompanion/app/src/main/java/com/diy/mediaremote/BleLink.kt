@@ -60,6 +60,8 @@ object BleLink {
     private var artData: ByteArray? = null
     private var artHave = false            // updateArt() has been called at least once
     private var artSentId = -1
+    private var mtuRetried = false          // asked for a bigger MTU a second time on this link
+    private var lastArtOp: Op.ArtChunk? = null
     private val queue = ArrayDeque<Op>()
     private var busy = false
     private val opTimeout = Runnable { Log.w(TAG, "GATT op timed out"); busy = false; next() }
@@ -149,6 +151,7 @@ object BleLink {
 
     private fun resetLinkState() {
         artSentId = -1
+        mtuRetried = false
         ready = false
         discovering = false
         mtu = 23
@@ -203,11 +206,23 @@ object BleLink {
             }
         }
         // album art: (re)send when the remote doesn't have the current image yet
-        if (artHave && artSentId != artId && chars[Protocol.ART] != null && mtu >= Protocol.ART_PACKET + 3) {
-            queue.removeAll { it is Op.ArtChunk }                // drop chunks of an older image
-            if (artData == null) queue.addLast(Op.ArtChunk(artId, -1))
-            else for (i in 0 until Protocol.ART_CHUNKS) queue.addLast(Op.ArtChunk(artId, i))
-            artSentId = artId
+        if (artHave && artSentId != artId) {
+            when {
+                chars[Protocol.ART] == null -> if (artData != null) NowPlaying.setCover(
+                    "Cover: the remote isn't offering its cover channel. Forget the remote in your phone's " +
+                    "Bluetooth settings, pair it again, then tap Reconnect now.")
+                mtu < Protocol.ART_PACKET + 3 -> if (artData != null) NowPlaying.setCover(
+                    "Cover: Bluetooth packet size too small (MTU $mtu, needs ${Protocol.ART_PACKET + 3}). Try Reconnect now.")
+                else -> {
+                    queue.removeAll { it is Op.ArtChunk }            // drop chunks of an older image
+                    if (artData == null) queue.addLast(Op.ArtChunk(artId, -1))
+                    else {
+                        for (i in 0 until Protocol.ART_CHUNKS) queue.addLast(Op.ArtChunk(artId, i))
+                        NowPlaying.setCover("Cover: sending...")
+                    }
+                    artSentId = artId
+                }
+            }
         }
         next()
     }
@@ -231,9 +246,13 @@ object BleLink {
                 val ch = chars[Protocol.ART]
                 val art = artData
                 if (ch == null || op.id != artId) false
-                else if (op.index < 0) writeChar(g, ch, Protocol.artNone(op.id), BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-                else if (art == null) false
-                else writeChar(g, ch, Protocol.artChunk(op.id, art, op.index), BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                else {
+                    lastArtOp = op
+                    // Acknowledged writes: each piece is confirmed, so a lost one is noticed and resent
+                    if (op.index < 0) writeChar(g, ch, Protocol.artNone(op.id))
+                    else if (art == null) false
+                    else writeChar(g, ch, Protocol.artChunk(op.id, art, op.index))
+                }
             }
             is Op.EnableNotify -> {
                 val ch = chars[op.uuid]
@@ -313,6 +332,7 @@ object BleLink {
                 if (g != gatt) return@post
                 if (status == BluetoothGatt.GATT_SUCCESS) mtu = newMtu
                 if (chars.isEmpty()) g.discoverServices()
+                else if (!ready) finishSetup()                           // answer to the second MTU request
             }
         }
 
@@ -328,21 +348,41 @@ object BleLink {
                 for (u in listOf(Protocol.TITLE, Protocol.ARTIST, Protocol.STATE, Protocol.COMMAND, Protocol.ART)) {
                     svc.getCharacteristic(u)?.let { chars[u] = it }
                 }
-                queue.clear()
-                busy = false
-                queue.addLast(Op.EnableNotify(Protocol.COMMAND))
-                ready = true
-                lastLinkedOrTriedMs = android.os.SystemClock.elapsedRealtime()
-                setStatus("Linked to remote")
-                listener?.onRemoteReady()
-                flush()
+                // If the first MTU request was never confirmed (common when the phone is already
+                // connected for the buttons), ask once more before using the link: covers need
+                // big packets, and titles are cut short at small ones.
+                if (mtu < Protocol.ART_PACKET + 3 && !mtuRetried && g.requestMtu(247)) {
+                    mtuRetried = true
+                    main.postDelayed({ if (g == gatt && !ready) finishSetup() }, 2000)
+                    return@post
+                }
+                finishSetup()
             }
+        }
+
+        private fun finishSetup() {
+            if (ready) return
+            queue.clear()
+            busy = false
+            queue.addLast(Op.EnableNotify(Protocol.COMMAND))
+            ready = true
+            lastLinkedOrTriedMs = android.os.SystemClock.elapsedRealtime()
+            setStatus("Linked to remote")
+            listener?.onRemoteReady()
+            flush()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
             main.post {
+                if (ch.uuid == Protocol.ART && status == BluetoothGatt.GATT_SUCCESS) {
+                    val op = lastArtOp
+                    if (op != null && op.id == artId && op.index == Protocol.ART_CHUNKS - 1) NowPlaying.setCover("Cover: sent to remote")
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    if (ch.uuid == Protocol.ART) artSentId = -1           // resend the image on the next update
+                    if (ch.uuid == Protocol.ART) {
+                        artSentId = -1                                       // resend the image on the next update
+                        NowPlaying.setCover("Cover: a piece failed to send (error $status), retrying")
+                    }
                     else sent.remove(ch.uuid)                            // retry on next update
                 }
                 opDone()

@@ -133,7 +133,7 @@ class MainActivity : Activity() {
         nowPlaying.text = when {
             !hasNotificationAccess() -> "Notification access is off (step 2)"
             !NowPlaying.listenerConnected -> "Media listener not running yet. If this stays, switch notification access off and on again."
-            else -> "${NowPlaying.text}\nchecked ${age}s ago"
+            else -> "${NowPlaying.text}\n${NowPlaying.cover}\nchecked ${age}s ago"
         }
     }
 
