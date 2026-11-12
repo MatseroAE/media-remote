@@ -1,0 +1,17 @@
+# Android
+.gradle/
+.idea/
+local.properties
+build/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+# Arduino / misc
+*.bin
+*.hex
+!firmware/prebuilt/*.uf2
+.DS_Store
+Thumbs.db
