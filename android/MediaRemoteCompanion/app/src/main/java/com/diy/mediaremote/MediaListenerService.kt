@@ -93,6 +93,8 @@ class MediaListenerService : NotificationListenerService(), BleLink.Listener {
 
     override fun onListenerDisconnected() {
         NowPlaying.listenerConnected = false
+        NowPlaying.setTrack(false, "", "", false, null)
+        NowPlaying.setArt(null)
         NowPlaying.set("(not reading media: Android paused the listener - open the app to restart it)")
         cleanup()
         NotificationListenerService.requestRebind(myComponent)
@@ -181,6 +183,7 @@ class MediaListenerService : NotificationListenerService(), BleLink.Listener {
         if (playing) lastPositionPushMs = SystemClock.elapsedRealtime()
         BleLink.update(title ?: "", artist ?: "", state)
         pushArt(c, md, title, artist)        // after the text, so the title shows first
+        NowPlaying.setTrack(c != null, title ?: "", artist ?: "", playing, c?.packageName)
         NowPlaying.set(
             if (c == null) "(no media app found)"
             else "${title ?: "?"} - ${artist ?: "?"}  [${if (playing) "playing" else "paused"}, ${c.packageName}]"
@@ -200,6 +203,7 @@ class MediaListenerService : NotificationListenerService(), BleLink.Listener {
         if (key == lastArtKey && bmp == null) return            // still nothing: don't resend "no art"
         lastArtKey = key
         lastArtHadBitmap = bmp != null
+        NowPlaying.setArt(bmp)
         val data = try { bmp?.let { Protocol.artToRgb565(it) } } catch (e: Exception) { null }
         if (data == null) {
             val webOnly = md != null && listOf(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, MediaMetadata.METADATA_KEY_ART_URI,

@@ -7,17 +7,31 @@
     <!-- Android 12+ : talk to an already-paired device (no scanning, no location) -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- Lets the app show Android's one-tap "let this app run in the background?" prompt -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- No INTERNET permission, on purpose: the app can't send anything anywhere except to the remote. -->
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <!-- Only so the screen can show the music app's name and icon ("via Spotify") -->
+    <queries>
+        <intent>
+            <action android:name="android.media.browse.MediaBrowserService" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"
-        android:icon="@android:drawable/ic_media_play"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Media Remote"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:theme="@style/Theme.MediaRemote">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

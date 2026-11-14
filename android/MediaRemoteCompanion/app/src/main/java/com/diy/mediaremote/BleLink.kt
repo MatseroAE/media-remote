@@ -37,6 +37,11 @@ object BleLink {
     var status: String = "Not started"
         private set
 
+    /** Coarse link state for the main screen (the [status] text stays for troubleshooting). */
+    enum class Link { IDLE, SETUP, BT_OFF, SEARCHING, CONNECTING, NEEDS_REPAIR, LINKED }
+    var link: Link = Link.IDLE
+        private set
+
     private val main = Handler(Looper.getMainLooper())
     private var ctx: Context? = null
     private var gatt: BluetoothGatt? = null
@@ -125,19 +130,19 @@ object BleLink {
         main.removeCallbacks(watchdog)
         main.removeCallbacks(reconnect)
         closeGatt()
-        setStatus("Stopped")
+        setStatus("Stopped", Link.IDLE)
     }
 
     private fun connect() {
         val c = ctx ?: return
-        if (!hasPermission(c)) { setStatus("Needs Bluetooth permission"); return }
-        val address = savedDevice(c) ?: run { setStatus("No remote selected"); return }
+        if (!hasPermission(c)) { setStatus("Needs Bluetooth permission", Link.SETUP); return }
+        val address = savedDevice(c) ?: run { setStatus("No remote selected", Link.SETUP); return }
         val adapter = c.getSystemService(BluetoothManager::class.java)?.adapter
-        if (adapter == null || !adapter.isEnabled) { setStatus("Bluetooth is off"); return }
+        if (adapter == null || !adapter.isEnabled) { setStatus("Bluetooth is off", Link.BT_OFF); return }
         val device = adapter.getRemoteDevice(address)
         main.removeCallbacks(reconnect)
         lastLinkedOrTriedMs = android.os.SystemClock.elapsedRealtime()
-        setStatus("Waiting for remote...")
+        setStatus("Waiting for remote...", Link.SEARCHING)
         // autoConnect = true: Android reconnects by itself whenever the remote is in range.
         gatt = device.connectGatt(c, true, callback, BluetoothDevice.TRANSPORT_LE)
     }
@@ -161,8 +166,9 @@ object BleLink {
         sent.clear()
     }
 
-    private fun setStatus(s: String) {
+    private fun setStatus(s: String, l: Link) {
         status = s
+        link = l
         Log.i(TAG, s)
         statusListener?.invoke(s)
     }
@@ -308,7 +314,7 @@ object BleLink {
                 if (g != gatt) return@post
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     retryDelayMs = RETRY_MIN_MS
-                    setStatus("Connected, setting up...")
+                    setStatus("Connected, setting up...", Link.CONNECTING)
                     resetLinkState()
                     discovering = true
                     if (!g.requestMtu(247)) g.discoverServices()
@@ -319,7 +325,7 @@ object BleLink {
                     // Close this connection object and open a fresh one: a dropped
                     // autoConnect link often never comes back by itself.
                     closeGatt()
-                    setStatus("Remote out of range / off - retrying...")
+                    setStatus("Remote out of range / off - retrying...", Link.SEARCHING)
                     main.removeCallbacks(reconnect)
                     main.postDelayed(reconnect, retryDelayMs)
                     retryDelayMs = minOf(retryDelayMs * 2, RETRY_MAX_MS)
@@ -342,7 +348,7 @@ object BleLink {
                 discovering = false
                 val svc = g.getService(Protocol.SERVICE)
                 if (svc == null) {
-                    setStatus("Connected, but 'Now Playing' service missing. Re-pair the remote (see README).")
+                    setStatus("Connected, but 'Now Playing' service missing. Re-pair the remote (see README).", Link.NEEDS_REPAIR)
                     return@post
                 }
                 for (u in listOf(Protocol.TITLE, Protocol.ARTIST, Protocol.STATE, Protocol.COMMAND, Protocol.ART)) {
@@ -367,7 +373,7 @@ object BleLink {
             queue.addLast(Op.EnableNotify(Protocol.COMMAND))
             ready = true
             lastLinkedOrTriedMs = android.os.SystemClock.elapsedRealtime()
-            setStatus("Linked to remote")
+            setStatus("Linked to remote", Link.LINKED)
             listener?.onRemoteReady()
             flush()
         }

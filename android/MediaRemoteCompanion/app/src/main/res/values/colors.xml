@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the remote's "Sharp" look: dark body, aluminium grey, orange power key -->
+    <color name="bg">#FF111214</color>
+    <color name="surface">#FF1B1D21</color>
+    <color name="accent">#FFFF7A1A</color>
+    <color name="ic_background">#FF1B1D21</color>
+</resources>
