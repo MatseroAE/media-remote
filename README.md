@@ -25,6 +25,11 @@ Hold the remote with the screen facing you.
 - Press **Side** to turn it back on.
 - Hold **Left + Right** while the remote resets to forget all paired phones.
 
+### Treadmill mode (experimental, not yet tested on hardware)
+The remote can also pose as a Bluetooth foot pod for a running watch: you set the treadmill's belt speed on the remote and the watch uses it for pace and distance. Hold **Side** for 1.5 s to switch between the music screen and the treadmill screen. See [`docs/treadmill-mode.md`](docs/treadmill-mode.md).
+
+`firmware/prebuilt/MediaRemote.uf2` is still the released firmware without treadmill mode.
+
 ## What you need
 | Part | Notes |
 |---|---|

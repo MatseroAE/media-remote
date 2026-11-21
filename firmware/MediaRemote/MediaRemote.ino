@@ -21,6 +21,24 @@
                   hold 3 s   = power off   (press SIDE again to turn on)
     Hold LEFT + RIGHT while powering on/resetting = forget all paired phones.
 
+  Treadmill mode (see "Treadmill mode" in the settings below)
+    The remote can also pose as a Bluetooth foot pod for a running watch
+    (written for a Garmin; it is the standard foot pod service). You set the
+    treadmill's belt speed and the watch uses that for pace and distance
+    instead of its wrist estimate.
+    The phone and the watch can both be connected at the same time.
+
+    SIDE  hold 1.5 s = switch between the music screen and the treadmill screen
+    On the treadmill screen:
+      LEFT / RIGHT  tap = speed -/+ 0.1 km/h      hold = keep changing
+      SIDE          tap = belt on / belt stopped  (stopped = the watch is sent 0)
+      SIDE          hold 0.6 s = volume mode, as on the music screen
+    While the belt is on you can go back to the music screen; the speed keeps
+    being sent and is shown in the status bar.
+    On the watch: Sensors & Accessories > Add New > Foot Pod, with the remote
+    on its treadmill screen. If the watch then ignores it, check the foot pod's
+    Speed setting on the watch (Indoor or Always).
+
   Arduino setup (see README.md for the full guide)
     Board package : "Seeed nRF52 Boards" 1.1.13+
                     (URL: https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json)
@@ -65,6 +83,24 @@ static constexpr uint32_t VOL_REPEAT_DELAY_MS = 400;
 static constexpr uint32_t VOL_REPEAT_MS       = 130;
 static constexpr uint32_t SIDE_HOLD_MS        = 600;   // side hold -> volume mode
 static constexpr uint32_t POWER_HOLD_MS       = 3000;  // side hold -> power off
+static constexpr uint32_t PAGE_HOLD_MS        = 1500;  // side hold -> switch music / treadmill screen (between the two above)
+
+// Treadmill mode: the remote poses as a Bluetooth foot pod and sends the speed you set.
+// Speeds are whole numbers of 0.1 km/h (100 = 10.0 km/h).
+static constexpr uint16_t TM_DEFAULT_TENTHS   = 100;   // speed shown when the remote is switched on
+static constexpr uint16_t TM_MIN_TENTHS       = 10;    // 1.0 km/h
+static constexpr uint16_t TM_MAX_TENTHS       = 250;   // 25.0 km/h
+static constexpr uint16_t TM_RUN_TENTHS       = 65;    // from 6.5 km/h the watch is told "running", below it "walking"
+static constexpr uint32_t TM_REPEAT_DELAY_MS  = 400;   // hold LEFT/RIGHT this long before the speed keeps changing
+static constexpr uint32_t TM_REPEAT_MS        = 100;   // then one 0.1 km/h step this often (1 km/h per second)
+static constexpr uint32_t TM_NO_WATCH_STOP_MS = 15UL * 60UL * 1000UL; // belt switches itself off after 15 min with no watch listening
+// What to put in the cadence field of the foot pod data (the field cannot be left out).
+//   0 = send zero. Try this first: the aim is for the watch to keep using its own wrist cadence.
+//   1 = send an ESTIMATE worked out from the speed. This is NOT a measurement. Use it only if
+//       the watch shows zero cadence, or refuses to show pace, with mode 0.
+#define TM_CADENCE_MODE            0
+#define TM_CAD_EST_OFFSET          150.0f   // steps/min at standstill (mode 1 only)
+#define TM_CAD_EST_SLOPE           2.0f     // extra steps/min per km/h (mode 1 only)
 
 // Colours (RGB565)
 #define COL_BG       TFT_BLACK
@@ -168,6 +204,39 @@ static constexpr uint8_t STATE_LEN = 12;
 
 enum : uint8_t { CMD_SEEK_BACK = 1, CMD_SEEK_FWD = 2 };
 
+// ----------------------------------------------------------------------------
+// BLE: foot pod (standard Running Speed and Cadence service), read by the watch
+// ----------------------------------------------------------------------------
+BLEService        rscService    (UUID16_SVC_RUNNING_SPEED_AND_CADENCE);   // 0x1814
+BLECharacteristic rscMeasurement(UUID16_CHR_RSC_MEASUREMENT);             // 0x2A53, notify
+BLECharacteristic rscFeature    (UUID16_CHR_RSC_FEATURE);                 // 0x2A54, read
+BLECharacteristic rscLocation   (UUID16_CHR_SENSOR_LOCATION);             // 0x2A5D, read
+
+// ----------------------------------------------------------------------------
+// BLE links. Up to two devices can be connected: the phone (media keys + app)
+// and the watch (foot pod data). The Bluetooth library's own "current
+// connection" only tracks the newest link, so every send below names its link.
+// ----------------------------------------------------------------------------
+static constexpr uint8_t  MAX_LINKS      = 2;
+static constexpr uint32_t LINK_SETTLE_MS = 6000;   // an unencrypted link that has not asked for foot pod data
+                                                   // by now is treated as a phone that is still pairing
+static volatile uint16_t linkHdl[MAX_LINKS]     = { BLE_CONN_HANDLE_INVALID, BLE_CONN_HANDLE_INVALID };
+static volatile uint32_t linkSince[MAX_LINKS]   = { 0, 0 };
+static volatile bool     linkSecured[MAX_LINKS] = { false, false };
+static uint16_t phoneHdl = BLE_CONN_HANDLE_INVALID;   // worked out in loop() by resolveLinks()
+static uint16_t watchHdl = BLE_CONN_HANDLE_INVALID;
+
+// Bluetooth memory plan. Two links need more of the RAM set aside for the Bluetooth stack.
+// If a plan does not fit, the remote restarts itself with the next one (about a second, once
+// after each time the battery is switched on). The plan number survives restarts and the
+// side-button power off; switching the battery off resets it.
+//   0 = two links, same per-link settings as before
+//   1 = two links, shorter radio slots per link (album art loads a little slower)
+//   2 = one link, exactly as before: no treadmill mode
+static constexpr uint8_t BLE_PLAN_MAGIC = 0xB0;
+static uint8_t blePlan  = 0;
+static uint8_t bleLinks = 1;
+
 static constexpr uint16_t TEXT_MAX = 120;
 
 // Buffers written from BLE callbacks, copied out in loop()
@@ -195,6 +264,20 @@ enum UiMode { MODE_TRACK, MODE_VOLUME };
 static UiMode   uiMode = MODE_TRACK;
 static uint32_t volModeUntil = 0;
 
+enum UiPage { PAGE_MEDIA, PAGE_TREADMILL };
+static UiPage   uiPage = PAGE_MEDIA;
+
+// Treadmill state. Distances are kept as (milliseconds x 0.1 km/h): 36000 of those = 1 metre.
+static bool     tmBeltOn = false;               // true = the set speed is being sent, false = 0 is sent
+static uint16_t tmTenths = TM_DEFAULT_TENTHS;   // set speed, 0.1 km/h
+static uint64_t tmTotalAcc = 0;                 // distance since switch-on (what the watch is sent; never goes back)
+static uint64_t tmRunAcc = 0;                   // distance of this run (shown on the treadmill screen)
+static uint32_t tmRunMs = 0;                    // belt-on time of this run
+static uint32_t tmLastTickMs = 0;
+static uint32_t tmNextNotifyMs = 0;
+static uint32_t tmWatchSeenMs = 0;
+static bool     wasWatch = false;
+
 static bool     screenOn = true;
 static uint32_t lastActivityMs = 0;
 static uint32_t screenKeepUntil = 0;     // extra keep-awake (track change)
@@ -215,6 +298,7 @@ static uint32_t toastUntil = 0;
 
 // Dirty flags for redraw
 static bool dirtyStatus = true, dirtyText = true, dirtyMid = true, dirtyBottom = true;
+static bool dirtyTmTop = true, dirtyTmInfo = true;
 static uint32_t lastMidDrawMs = 0;
 
 Seeed_GFX display;
@@ -247,6 +331,7 @@ struct Button {
 struct ArrowState {
   bool     seeking = false;   // hold-to-seek active
   bool     hidHeld = false;   // FF/REW key currently held down via HID
+  bool     blind   = false;   // treadmill screen: this press only woke the display
   uint32_t nextRepeat = 0;
 };
 
@@ -282,8 +367,13 @@ static uint32_t currentPositionMs(uint32_t now) {
   return p;
 }
 
+static bool phoneConnected() { return phoneHdl != BLE_CONN_HANDLE_INVALID; }
+static bool watchConnected() { return watchHdl != BLE_CONN_HANDLE_INVALID; }
+static bool tmAvailable()    { return bleLinks >= 2; }                          // false on memory plan 2
+static bool tmActive()       { return uiPage == PAGE_TREADMILL || tmBeltOn; }   // a watch link is wanted
+
 static bool appLinked() {
-  return Bluefruit.connected() && npCommand.notifyEnabled();
+  return phoneConnected() && npCommand.notifyEnabled(phoneHdl);
 }
 
 static void showToast(const char* msg, uint32_t ms = 900) {
@@ -337,6 +427,7 @@ static constexpr int COL_X = 74;
 static constexpr int COL_W = SCR_W - COL_X;
 
 Seeed_Sprite sprStatus, sprMid, sprBottom;
+Seeed_Sprite sprTmTop, sprTmInfo;     // treadmill screen: y 22..73 speed + pace, y 76..109 belt state, time, distance
 
 struct Marquee {
   Seeed_Sprite spr;
@@ -394,13 +485,23 @@ static void drawStatusBar() {
   s.fillSprite(COL_BG);
   s.setTextFont(2);
 
-  // Connection state (left)
-  uint16_t c; const char* msg;
-  if (!Bluefruit.connected())  { c = COL_ACCENT; msg = "Waiting for phone..."; }
-  else if (!appLinked())       { c = COL_WARN;   msg = "Connected (no app)"; }
-  else                         { c = COL_OK;     msg = "Connected"; }
+  // Connection state (left): the watch on the treadmill screen, the phone on the music screen
+  uint16_t c; const char* msg; char beltMsg[24];
+  uint16_t msgCol = COL_DIM;
+  if (uiPage == PAGE_TREADMILL) {
+    if (watchConnected())      { c = COL_OK;     msg = "Watch connected"; }
+    else                       { c = COL_ACCENT; msg = "Waiting for watch..."; }
+  } else {
+    if (!phoneConnected())     { c = COL_ACCENT; msg = "Waiting for phone..."; }
+    else if (!appLinked())     { c = COL_WARN;   msg = "Connected (no app)"; }
+    else                       { c = COL_OK;     msg = "Connected"; }
+    if (tmBeltOn) {            // belt running in the background: show its speed instead of the text
+      snprintf(beltMsg, sizeof(beltMsg), "Belt %u.%u km/h", (unsigned)(tmTenths / 10), (unsigned)(tmTenths % 10));
+      msg = beltMsg; msgCol = COL_TEXT;
+    }
+  }
   s.fillCircle(7, 9, 4, c);
-  s.setTextColor(COL_DIM, COL_BG);
+  s.setTextColor(msgCol, COL_BG);
   s.drawString(msg, 16, 1);
 
   // Battery (right)
@@ -432,7 +533,7 @@ static void updateTextLines() {
   if (track.title[0]) {
     mqTitle.set(track.title, COL_TEXT);
     mqArtist.set(track.artist[0] ? track.artist : "", COL_DIM);
-  } else if (!Bluefruit.connected()) {
+  } else if (!phoneConnected()) {
     mqTitle.set(DEVICE_NAME, COL_TEXT);
     mqArtist.set("Pair it in Android Settings > Bluetooth", COL_DIM);
   } else if (!appLinked()) {
@@ -493,10 +594,12 @@ static void drawBottomBar(uint32_t now) {
   s.drawFastHLine(0, 0, SCR_W, COL_FAINT);
   const int cy = 13;
 
-  if (uiMode == MODE_VOLUME) {
-    s.fillRect(14, cy - 2, 16, 4, COL_TEXT);                  // "-"
-    s.fillRect(SCR_W - 30, cy - 2, 16, 4, COL_TEXT);          // "+"
-    s.fillRect(SCR_W - 24, cy - 8, 4, 16, COL_TEXT);
+  const bool tmPage = (uiPage == PAGE_TREADMILL);
+  if (uiMode == MODE_VOLUME || tmPage) {
+    const uint16_t pm = (uiMode == MODE_VOLUME) ? COL_TEXT : COL_DIM;
+    s.fillRect(14, cy - 2, 16, 4, pm);                        // "-"
+    s.fillRect(SCR_W - 30, cy - 2, 16, 4, pm);                // "+"
+    s.fillRect(SCR_W - 24, cy - 8, 4, 16, pm);
   } else {
     iconPrev(s, 22, cy, 12, COL_DIM);
     iconNext(s, SCR_W - 22, cy, 12, COL_DIM);
@@ -504,9 +607,18 @@ static void drawBottomBar(uint32_t now) {
 
   s.setTextFont(2);
   const char* center;
+  char volMsg[20];
   uint16_t c = COL_FAINT;
   if (toastText[0] && now < toastUntil) { center = toastText; c = COL_TEXT; }
-  else center = (uiMode == MODE_VOLUME) ? "VOLUME" : "hold side: volume";
+  else if (uiMode == MODE_VOLUME) {
+    center = "VOLUME";
+    if (tmPage && track.hasState && track.volMax > 0) {       // no volume bar on the treadmill screen: show the level here
+      snprintf(volMsg, sizeof(volMsg), "VOLUME %d%%", (int)(track.vol * 100 / track.volMax));
+      center = volMsg; c = COL_TEXT;
+    }
+  }
+  else if (tmPage) center = tmBeltOn ? "side: stop belt" : "side: start belt";
+  else center = "hold side: volume";
   s.setTextColor(c, COL_BG);
   s.drawString(center, (SCR_W - s.textWidth(center)) / 2, 5);
   s.pushSprite(0, 111);
@@ -536,16 +648,82 @@ static void drawArt() {
   display.fillTriangle(cx - 5, cy - 14, cx - 5, cy - 8, cx + 18, cy - 12, c);
 }
 
+// ----------------------------------------------------------------------------
+// Treadmill screen
+// ----------------------------------------------------------------------------
+static void drawTmTop() {
+  Seeed_Sprite& s = sprTmTop;   // 240 x 52
+  s.fillSprite(COL_BG);
+  char buf[16];
+
+  // set speed, large, on the left
+  snprintf(buf, sizeof(buf), "%u.%u", (unsigned)(tmTenths / 10), (unsigned)(tmTenths % 10));
+  s.setTextFont(6);
+  s.setTextColor(tmBeltOn ? COL_TEXT : COL_DIM, COL_BG);
+  int w = s.textWidth(buf);
+  s.drawString(buf, 6, 2);
+  s.setTextFont(2);
+  s.setTextColor(COL_DIM, COL_BG);
+  s.drawString("km/h", 6 + w + 6, 32);
+
+  // the same speed as a pace, on the right
+  uint32_t secPerKm = (36000UL + tmTenths / 2) / tmTenths;
+  snprintf(buf, sizeof(buf), "%lu:%02lu", (unsigned long)(secPerKm / 60), (unsigned long)(secPerKm % 60));
+  s.setTextFont(4);
+  s.setTextColor(tmBeltOn ? COL_ACCENT : COL_DIM, COL_BG);
+  s.drawString(buf, SCR_W - 6 - s.textWidth(buf), 4);
+  s.setTextFont(2);
+  s.setTextColor(COL_DIM, COL_BG);
+  const char* u = "min/km";
+  s.drawString(u, SCR_W - 6 - s.textWidth(u), 32);
+
+  s.pushSprite(0, 22);
+}
+
+static void drawTmInfo() {
+  Seeed_Sprite& s = sprTmInfo;  // 240 x 34
+  s.fillSprite(COL_BG);
+  s.setTextFont(2);
+  char buf[20];
+
+  // line 1: belt state (left), belt-on time (right)
+  s.fillCircle(11, 8, 4, tmBeltOn ? COL_OK : COL_FAINT);
+  s.setTextColor(tmBeltOn ? COL_OK : COL_DIM, COL_BG);
+  s.drawString(tmBeltOn ? "BELT ON" : "BELT STOPPED", 22, 0);
+  formatTime(buf, sizeof(buf), tmRunMs);
+  s.setTextColor(COL_TEXT, COL_BG);
+  s.drawString(buf, SCR_W - 6 - s.textWidth(buf), 0);
+
+  // line 2: what the watch is getting (left), distance (right)
+  s.setTextColor(COL_FAINT, COL_BG);
+  s.drawString(!watchConnected() ? "add as Foot Pod on watch" : tmBeltOn ? "watch gets this speed" : "watch gets 0", 6, 17);
+  uint32_t m = (uint32_t)(tmRunAcc / 36000ULL);
+  snprintf(buf, sizeof(buf), "%lu.%02lu km", (unsigned long)(m / 1000), (unsigned long)((m % 1000) / 10));
+  s.setTextColor(COL_TEXT, COL_BG);
+  s.drawString(buf, SCR_W - 6 - s.textWidth(buf), 17);
+
+  s.pushSprite(0, 76);
+}
+
 static void fullRedraw() {
   display.fillScreen(COL_BG);
   display.drawFastHLine(0, 19, SCR_W, COL_FAINT);
   dirtyStatus = dirtyText = dirtyMid = dirtyBottom = dirtyArt = true;
+  dirtyTmTop = dirtyTmInfo = true;
   mqTitle.dirty = mqArtist.dirty = true;
 }
 
 static void render(uint32_t now) {
   if (!screenOn) return;
   if (dirtyStatus) { dirtyStatus = false; drawStatusBar(); }
+  if (uiPage == PAGE_TREADMILL) {
+    if (toastText[0] && now >= toastUntil) { toastText[0] = 0; dirtyBottom = true; }
+    if (dirtyMid)    { dirtyMid = false; if (uiMode == MODE_VOLUME) dirtyBottom = true; }   // volume level changed
+    if (dirtyTmTop)  { dirtyTmTop = false; drawTmTop(); }
+    if (dirtyTmInfo) { dirtyTmInfo = false; drawTmInfo(); }
+    if (dirtyBottom) { dirtyBottom = false; drawBottomBar(now); }
+    return;
+  }
   if (dirtyText)   { dirtyText = false; updateTextLines(); }
   if (dirtyArt)    { dirtyArt = false; drawArt(); }
   mqTitle.tick(now);
@@ -606,11 +784,11 @@ static void userActivity() {
 // Sending keys / commands
 // ----------------------------------------------------------------------------
 static void hidSend(uint16_t usage) {
-  if (Bluefruit.connected()) blehid.inputReport(HID_REPORT_ID, &usage, sizeof(usage));
+  if (phoneConnected()) blehid.inputReport(phoneHdl, HID_REPORT_ID, &usage, sizeof(usage));
 }
 
 static bool hidTap(uint16_t usage) {
-  if (!Bluefruit.connected()) { showToast("Not connected"); return false; }
+  if (!phoneConnected()) { showToast("Not connected"); return false; }
   hidSend(usage);
   delay(10);
   hidSend(0);
@@ -618,7 +796,7 @@ static bool hidTap(uint16_t usage) {
 }
 
 static void sendAppCommand(uint8_t cmd) {
-  if (appLinked()) npCommand.notify8(cmd);
+  if (appLinked()) npCommand.notify8(phoneHdl, cmd);
 }
 
 // ----------------------------------------------------------------------------
@@ -644,8 +822,12 @@ static void powerOff(const char* reason) {
   while (digitalRead(BTN_SIDE) == LOW) delay(10);   // must release first or it wakes instantly
   delay(50);
 
+  Bluefruit.Advertising.restartOnDisconnect(false);
   Bluefruit.Advertising.stop();
-  if (Bluefruit.connected()) Bluefruit.disconnect(Bluefruit.connHandle());
+  for (uint8_t i = 0; i < MAX_LINKS; i++) {          // phone and watch
+    uint16_t h = linkHdl[i];
+    if (h != BLE_CONN_HANDLE_INVALID) Bluefruit.disconnect(h);
+  }
   delay(100);
   screenSleep();
   systemOff(BTN_SIDE, LOW);
@@ -659,7 +841,100 @@ static void powerOff(const char* reason) {
 
 Button btnLeft, btnRight, btnSide;
 ArrowState stLeft, stRight;
-static uint8_t sideStage = 0;   // 0 = short, 1 = volume toggled, 2 = power-off armed
+static uint8_t sideStage = 0;   // 0 = short, 1 = volume toggled, 2 = screen switch armed, 3 = power-off armed
+static bool    sideBlind = false;   // treadmill screen: this press only woke the display
+
+// ----------------------------------------------------------------------------
+// Treadmill mode
+// ----------------------------------------------------------------------------
+static void tmSetBelt(bool on) {
+  if (on == tmBeltOn) return;
+  uint32_t now = millis();
+  tmBeltOn = on;
+  tmLastTickMs = now;
+  tmWatchSeenMs = now;
+  tmNextNotifyMs = 0;                       // tell the watch straight away
+  LOG("Belt %s at %u.%u km/h", on ? "on" : "stopped", (unsigned)(tmTenths / 10), (unsigned)(tmTenths % 10));
+  dirtyTmTop = dirtyTmInfo = dirtyBottom = dirtyStatus = true;
+}
+
+static void tmStep(int dir) {
+  int v = (int)tmTenths + dir;
+  if (v < (int)TM_MIN_TENTHS) v = TM_MIN_TENTHS;
+  if (v > (int)TM_MAX_TENTHS) v = TM_MAX_TENTHS;
+  if (v == (int)tmTenths) return;
+  tmTenths = (uint16_t)v;
+  dirtyTmTop = true;
+  if (tmBeltOn) dirtyStatus = true;
+}
+
+// Builds the 8-byte foot pod packet (RSC Measurement). Returns its length.
+//   byte 0     flags: bit1 = total distance present, bit2 = running (else walking)
+//   byte 1-2   speed, units of 1/256 m/s, little-endian
+//   byte 3     cadence, steps per minute
+//   byte 4-7   total distance, units of 0.1 m, little-endian
+static uint8_t tmBuildPacket(uint8_t* buf) {
+  uint16_t tenths = tmBeltOn ? tmTenths : 0;
+  uint16_t spd = (uint16_t)(((uint32_t)tenths * 64UL + 4UL) / 9UL);   // 0.1 km/h -> 1/256 m/s  (x 256 / 36)
+  uint8_t  cad = 0;
+#if TM_CADENCE_MODE == 1
+  if (tenths >= 5) {
+    float c = TM_CAD_EST_OFFSET + TM_CAD_EST_SLOPE * (tenths / 10.0f);
+    cad = (uint8_t)(c < 0.0f ? 0.0f : c > 254.0f ? 254.0f : c);
+  }
+#endif
+  uint32_t dm = (uint32_t)(tmTotalAcc / 3600ULL);                     // 0.1 m
+  buf[0] = (uint8_t)(0x02 | (tenths >= TM_RUN_TENTHS ? 0x04 : 0x00));
+  buf[1] = (uint8_t)(spd & 0xFF);
+  buf[2] = (uint8_t)(spd >> 8);
+  buf[3] = cad;
+  buf[4] = (uint8_t)(dm & 0xFF);
+  buf[5] = (uint8_t)((dm >> 8) & 0xFF);
+  buf[6] = (uint8_t)((dm >> 16) & 0xFF);
+  buf[7] = (uint8_t)((dm >> 24) & 0xFF);
+  return 8;
+}
+
+// Called every pass of loop(): adds up distance and sends the watch one packet a second.
+static void tmTick(uint32_t now) {
+  uint32_t dt = now - tmLastTickMs;
+  tmLastTickMs = now;
+  if (!tmAvailable()) return;
+
+  if (tmBeltOn) {
+    uint64_t d = (uint64_t)dt * tmTenths;
+    tmTotalAcc += d;
+    tmRunAcc   += d;
+    uint32_t secBefore = tmRunMs / 1000;
+    tmRunMs += dt;
+    if (tmRunMs / 1000 != secBefore) dirtyTmInfo = true;     // clock and distance, once a second
+  }
+
+  if (watchConnected()) tmWatchSeenMs = now;
+  if (tmBeltOn && now - tmWatchSeenMs > TM_NO_WATCH_STOP_MS) {
+    tmSetBelt(false);                                        // nobody is listening: stop, so auto power-off can work
+    showToast("Belt stopped: no watch", 4000);
+  }
+
+  if (watchConnected() && now >= tmNextNotifyMs) {
+    tmNextNotifyMs = now + 1000;
+    uint8_t packet[8];
+    uint8_t len = tmBuildPacket(packet);
+    rscMeasurement.notify(watchHdl, packet, len);
+  }
+}
+
+static void setPage(UiPage p) {
+  if (p == uiPage) return;
+  if (stLeft.hidHeld || stRight.hidHeld) hidSend(0);         // don't leave a fast-forward key held down
+  stLeft = ArrowState();
+  stRight = ArrowState();
+  if (uiPage == PAGE_TREADMILL && !tmBeltOn) { tmRunAcc = 0; tmRunMs = 0; }   // left with the belt stopped: run over, clear the totals
+  uiPage = p;
+  uiMode = MODE_TRACK;
+  LOG("%s screen", p == PAGE_TREADMILL ? "Treadmill" : "Music");
+  fullRedraw();
+}
 
 static void enterVolumeMode(bool on) {
   if ((uiMode == MODE_VOLUME) != on) LOG("%s volume mode", on ? "Enter" : "Leave");
@@ -680,7 +955,28 @@ static void volumeStep(int dir) {
   dirtyMid = true;
 }
 
+// LEFT / RIGHT on the treadmill screen: speed down / up
+static void handleTmArrow(Button& b, ArrowState& s, int dir, uint32_t now) {
+  if (b.pressed) {
+    s.blind = !screenOn;                    // screen was asleep: just wake it, don't change the speed unseen
+    userActivity();
+    s.seeking = s.hidHeld = false;
+    if (!s.blind) {
+      tmStep(dir);
+      s.nextRepeat = now + TM_REPEAT_DELAY_MS;
+    }
+  }
+  if (b.down && !s.blind && now >= s.nextRepeat) {
+    tmStep(dir);
+    s.nextRepeat = now + TM_REPEAT_MS;
+    lastActivityMs = now;
+  }
+  if (b.released) s.blind = false;
+}
+
 static void handleArrow(Button& b, ArrowState& s, int dir, uint32_t now) {
+  if (uiPage == PAGE_TREADMILL && uiMode != MODE_VOLUME) { handleTmArrow(b, s, dir, now); return; }
+
   if (b.pressed) {
     userActivity();
     s.seeking = s.hidHeld = false;
@@ -703,7 +999,7 @@ static void handleArrow(Button& b, ArrowState& s, int dir, uint32_t now) {
         sendAppCommand(dir > 0 ? CMD_SEEK_FWD : CMD_SEEK_BACK);
         s.nextRepeat = now + SEEK_REPEAT_MS;
         showToast(dir > 0 ? ">> +10s" : "<< -10s");
-      } else if (Bluefruit.connected()) {
+      } else if (phoneConnected()) {
         hidSend(dir > 0 ? KEY_FFWD : KEY_REWIND);    // hold the key until release
         s.hidHeld = true;
         showToast(dir > 0 ? "Fast forward" : "Rewind", 60000);
@@ -728,7 +1024,11 @@ static void handleArrow(Button& b, ArrowState& s, int dir, uint32_t now) {
 }
 
 static void handleSide(uint32_t now) {
-  if (btnSide.pressed) { userActivity(); sideStage = 0; }
+  if (btnSide.pressed) {
+    sideBlind = !screenOn && uiPage == PAGE_TREADMILL;   // screen asleep on the treadmill screen: a tap only wakes it
+    userActivity();
+    sideStage = 0;
+  }
 
   if (btnSide.down) {
     uint32_t h = btnSide.heldFor(now);
@@ -736,23 +1036,38 @@ static void handleSide(uint32_t now) {
       sideStage = 1;
       enterVolumeMode(uiMode != MODE_VOLUME);
     }
-    if (sideStage == 1 && h >= POWER_HOLD_MS) {
+    if (sideStage == 1 && h >= PAGE_HOLD_MS) {
       sideStage = 2;
       enterVolumeMode(false);
+      if (!tmAvailable())                  showToast("No treadmill mode", 60000);   // Bluetooth memory plan 2
+      else if (uiPage == PAGE_TREADMILL)   showToast("Release: music", 60000);
+      else                                 showToast("Release: treadmill", 60000);
+    }
+    if (sideStage == 2 && h >= POWER_HOLD_MS) {
+      sideStage = 3;
       showToast("Release to power off", 60000);
     }
   }
 
   if (btnSide.released) {
     if (sideStage == 0) {
-      if (hidTap(KEY_PLAY_PAUSE)) {
+      if (sideBlind) {
+        // only woke the screen
+      } else if (uiPage == PAGE_TREADMILL) {
+        tmSetBelt(!tmBeltOn);
+        showToast(tmBeltOn ? "Belt on" : "Belt stopped");
+      } else if (hidTap(KEY_PLAY_PAUSE)) {
         if (track.hasState) showToast(track.playing ? "Pause" : "Play");
         else                showToast("Play / Pause");
       }
     } else if (sideStage == 2) {
+      toastUntil = 0;                                        // clear the "Release: ..." hint
+      if (tmAvailable()) setPage(uiPage == PAGE_TREADMILL ? PAGE_MEDIA : PAGE_TREADMILL);
+    } else if (sideStage == 3) {
       powerOff("Side button held 3 s");
     }
     sideStage = 0;
+    sideBlind = false;
   }
 }
 
@@ -813,7 +1128,10 @@ static void pollPower(bool readVoltage) {
   if (pct != batPercent) {
     batPercent = pct;
     dirtyStatus = true;
-    if (pct >= 0) { blebas.write((uint8_t)pct); blebas.notify((uint8_t)pct); }
+    if (pct >= 0) {
+      blebas.write((uint8_t)pct);
+      if (phoneConnected()) blebas.notify(phoneHdl, (uint8_t)pct);
+    }
   }
 }
 
@@ -867,13 +1185,68 @@ static void onStateWrite(uint16_t, BLECharacteristic*, uint8_t* data, uint16_t l
 }
 
 static void onConnect(uint16_t conn) {
-  (void)conn;
+  for (uint8_t i = 0; i < MAX_LINKS; i++) {
+    if (linkHdl[i] == BLE_CONN_HANDLE_INVALID) {
+      linkSecured[i] = false;
+      linkSince[i] = millis();
+      linkHdl[i] = conn;
+      break;
+    }
+  }
   bleConnEvent = true;
 }
 
 static void onDisconnect(uint16_t conn, uint8_t reason) {
-  (void)conn; (void)reason;
+  (void)reason;
+  for (uint8_t i = 0; i < MAX_LINKS; i++) {
+    if (linkHdl[i] == conn) { linkHdl[i] = BLE_CONN_HANDLE_INVALID; linkSecured[i] = false; }
+  }
   bleConnEvent = true;
+}
+
+static void onSecured(uint16_t conn) {           // the link is now encrypted: only a paired phone does this
+  for (uint8_t i = 0; i < MAX_LINKS; i++) {
+    if (linkHdl[i] == conn) linkSecured[i] = true;
+  }
+  bleConnEvent = true;
+}
+
+// Work out which link is the phone and which is the watch.
+//   watch = the link that has switched on foot pod notifications
+//   phone = any other link once it is encrypted (media keys need that), or after LINK_SETTLE_MS
+static void resolveLinks(uint32_t now) {
+  uint16_t cand = BLE_CONN_HANDLE_INVALID, watch = BLE_CONN_HANDLE_INVALID;
+  bool candSec = false, curOk = false, curSec = false;
+  for (uint8_t i = 0; i < MAX_LINKS; i++) {
+    uint16_t h = linkHdl[i];
+    if (h == BLE_CONN_HANDLE_INVALID) continue;
+    if (tmAvailable() && rscMeasurement.notifyEnabled(h)) { watch = h; continue; }
+    bool sec = linkSecured[i];
+    if (h == phoneHdl) { curOk = true; curSec = sec; continue; }                  // the link already chosen as the phone
+    if (!sec && tmAvailable() && now - linkSince[i] < LINK_SETTLE_MS) continue;   // too early to tell
+    if (cand == BLE_CONN_HANDLE_INVALID || (sec && !candSec)) { cand = h; candSec = sec; }
+  }
+  // Stay with the current phone link, unless it has gone or an encrypted link has turned up beside an unencrypted one.
+  if (!curOk || (!curSec && candSec)) phoneHdl = cand;
+  watchHdl = watch;
+}
+
+// Keep advertising whenever a device we want is missing and a link is free. (With two links the
+// library's own restart-on-disconnect only fires when *nothing* is connected.)
+static void updateAdvertising() {
+  uint8_t links = 0;
+  for (uint8_t i = 0; i < MAX_LINKS; i++) if (linkHdl[i] != BLE_CONN_HANDLE_INVALID) links++;
+  bool want = links < bleLinks && (!phoneConnected() || (tmActive() && !watchConnected()));
+  bool running = Bluefruit.Advertising.isRunning();
+  static bool startPending = false;        // start only if still needed on the next check (100 ms later), so the
+                                           // library's own fast-to-slow switch is never mistaken for "stopped"
+  if (want && !running) {
+    if (startPending) { startPending = false; Bluefruit.Advertising.start(0); }
+    else startPending = true;
+  } else {
+    startPending = false;
+    if (!want && running) Bluefruit.Advertising.stop();
+  }
 }
 
 // Copy anything the BLE callbacks received into `track`
@@ -950,14 +1323,66 @@ static void pullBleData(uint32_t now) {
 // ----------------------------------------------------------------------------
 // BLE setup
 // ----------------------------------------------------------------------------
+// The plan number is kept in a register that survives restarts (GPREGRET2; the bootloader uses GPREGRET).
+static uint8_t readBlePlan() {
+  uint32_t v = NRF_POWER->GPREGRET2;
+  return ((v & 0xF0) == BLE_PLAN_MAGIC && (v & 0x0F) <= 2) ? (uint8_t)(v & 0x0F) : 0;
+}
+
+static void storeBlePlanAndRestart(uint8_t plan) {
+  uint8_t sdOn = 0;
+  sd_softdevice_is_enabled(&sdOn);
+  if (sdOn) {
+    sd_power_gpregret_clr(1, 0xFF);
+    sd_power_gpregret_set(1, (uint32_t)(BLE_PLAN_MAGIC | plan));
+  } else {
+    NRF_POWER->GPREGRET2 = (uint32_t)(BLE_PLAN_MAGIC | plan);
+  }
+  delay(50);
+  NVIC_SystemReset();
+}
+
+static void setupRsc() {
+  rscService.begin();
+
+  rscMeasurement.setProperties(CHR_PROPS_NOTIFY);
+  rscMeasurement.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  rscMeasurement.setFixedLen(8);
+  rscMeasurement.begin();
+
+  // Features: bit1 = total distance, bit2 = walking/running status
+  rscFeature.setProperties(CHR_PROPS_READ);
+  rscFeature.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  rscFeature.setFixedLen(2);
+  rscFeature.begin();
+  rscFeature.write16(0x0006);
+
+  // Sensor location: 1 = top of shoe
+  rscLocation.setProperties(CHR_PROPS_READ);
+  rscLocation.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  rscLocation.setFixedLen(1);
+  rscLocation.begin();
+  rscLocation.write8(1);
+}
+
 static void setupBle() {
-  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);   // bigger MTU for track titles
-  Bluefruit.begin();
+  // Pick the Bluetooth memory plan (see blePlan above). Plans 0 and 2 use the same per-link
+  // settings as before (bigger MTU for track titles and album art).
+  blePlan = readBlePlan();
+  if (blePlan == 1) Bluefruit.configPrphConn(BLE_GATT_ATT_MTU_MAX, 6, 3, BLE_GATTC_WRITE_CMD_TX_QUEUE_SIZE_DEFAULT);
+  else              Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  bleLinks = (blePlan <= 1) ? 2 : 1;
+  LOG("Bluetooth memory plan %u (%u link%s)", blePlan, bleLinks, bleLinks > 1 ? "s" : "");
+  if (!Bluefruit.begin(bleLinks, 0)) {
+    LOG("Bluetooth plan %u did not start", blePlan);
+    if (blePlan < 2) storeBlePlanAndRestart(blePlan + 1);   // does not return
+  }
   Bluefruit.autoConnLed(false);                   // save power
   Bluefruit.setTxPower(4);
   Bluefruit.setName(DEVICE_NAME);
   Bluefruit.Periph.setConnectCallback(onConnect);
   Bluefruit.Periph.setDisconnectCallback(onDisconnect);
+  Bluefruit.Security.setSecuredCallback(onSecured);
 
   bledis.setManufacturer("DIY");
   bledis.setModel("XIAO nRF52840 Media Remote");
@@ -1003,11 +1428,16 @@ static void setupBle() {
   npArt.setWriteCallback(onArtWrite);
   npArt.begin();
 
-  // Advertising: flags + tx power + appearance + HID service + name (fits 31 bytes)
+  // Foot pod service, added last so the services the phone already knows keep their places.
+  if (tmAvailable()) setupRsc();
+
+  // Advertising: flags + tx power + appearance + HID (+ foot pod) service + name
+  //   3 + 3 + 4 + 6 + 14 = 30 of the 31 bytes with both services and the 12-letter name
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addAppearance(0x03C0);    // Generic HID
-  Bluefruit.Advertising.addService(blehid);
+  if (tmAvailable()) Bluefruit.Advertising.addService(blehid, rscService);   // the watch looks for the foot pod service here
+  else               Bluefruit.Advertising.addService(blehid);
   Bluefruit.Advertising.addName();
   Bluefruit.ScanResponse.addService(npService);   // lets the app find it by UUID too
   Bluefruit.Advertising.restartOnDisconnect(true);
@@ -1047,6 +1477,10 @@ void setup() {
   mqArtist.begin(COL_X - 4, 53, COL_W + 4, 18, 2);
 
   setupBle();
+  if (tmAvailable()) {                       // after setupBle(): it may restart the remote with another memory plan
+    sprTmTop.createSprite(display, SCR_W, 52);
+    sprTmInfo.createSprite(display, SCR_W, 34);
+  }
 
   // Hold LEFT + RIGHT at power-on to forget all paired phones
   if (digitalRead(BTN_LEFT) == LOW && digitalRead(BTN_RIGHT) == LOW) {
@@ -1061,27 +1495,41 @@ void setup() {
 
   pollPower(true);
   nextBatReadMs = millis() + 30000;
-  lastActivityMs = lastConnectedMs = millis();
+  lastActivityMs = lastConnectedMs = tmLastTickMs = millis();
   fullRedraw();
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // --- connection changes
-  if (bleConnEvent) {
+  // --- connection changes (phone and watch are tracked separately)
+  static uint32_t nextLinkCheckMs = 0;
+  if (bleConnEvent || now >= nextLinkCheckMs) {
     bleConnEvent = false;
-    bool c = Bluefruit.connected();
-    if (!c) {                         // forget stale track info on disconnect
+    nextLinkCheckMs = now + 100;
+    resolveLinks(now);
+    updateAdvertising();
+  }
+  bool connected = phoneConnected();
+  if (connected != wasConnected) {
+    if (!connected) {                 // forget stale track info on disconnect
       track = Track();
       artValid = false; artWaitSince = 0; dirtyArt = true;
       uiMode = MODE_TRACK;
+      dirtyBottom = true;
     }
-    LOG("%s", c ? "Phone connected" : "Phone disconnected");
-    showToast(c ? "Phone connected" : "Disconnected", 1500);
+    LOG("%s", connected ? "Phone connected" : "Phone disconnected");
+    showToast(connected ? "Phone connected" : "Phone disconnected", 1500);
     userActivity();
   }
-  bool connected = Bluefruit.connected();
+  bool watch = watchConnected();
+  if (watch != wasWatch) {
+    wasWatch = watch;
+    LOG("%s", watch ? "Watch connected" : "Watch disconnected");
+    showToast(watch ? "Watch connected" : "Watch disconnected", 1500);
+    dirtyStatus = dirtyTmInfo = true;
+    userActivity();
+  }
   bool linked = appLinked();
   if (connected != wasConnected || linked != wasAppLinked) {
     wasConnected = connected; wasAppLinked = linked;
@@ -1099,6 +1547,8 @@ void loop() {
   handleArrow(btnRight, stRight, +1, now);
   handleSide(now);
 
+  tmTick(now);
+
   if (uiMode == MODE_VOLUME && now >= volModeUntil && !btnLeft.down && !btnRight.down && !btnSide.down) {
     enterVolumeMode(false);
   }
@@ -1112,7 +1562,7 @@ void loop() {
   if (screenOn && !anyDown && now - lastActivityMs > SCREEN_TIMEOUT_MS && now > screenKeepUntil) {
     screenSleep();
   }
-  if (!connected && !anyDown && now - lastConnectedMs > AUTO_OFF_DISCONNECTED_MS &&
+  if (!connected && !anyDown && !tmBeltOn && now - lastConnectedMs > AUTO_OFF_DISCONNECTED_MS &&
       now - lastActivityMs > AUTO_OFF_DISCONNECTED_MS) {
     powerOff("No phone for 10 min");
   }
